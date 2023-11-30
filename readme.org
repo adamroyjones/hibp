@@ -1,0 +1,238 @@
+* When is a leak not a leak?
+
+** Summary
+This article is about a simple case of a Go program using more memory than one
+might expect. It discusses how the problem can be interrogated using Go's
+tooling and how it can be fixed.
+
+** Introduction
+At Ravelin, we make use of data from [[https://haveibeenpwned.com/API/v3#SearchingPwnedPasswordsByRange][the range API of haveibeenpwned.com]]. As
+good citizens, we pull the data and internally rehost it; this avoids hammering
+their API.
+
+A typical request is an HTTP GET of https://api.pwnedpasswords.com/range/{hash}
+where =hash= is a five-character hexadecimal string. Each response is around
+32KB. The variation around this is on the order of a few KB. We therefore expect
+to fetch around 33GB of data comprising $16^5 \approx 10^6$ files.
+
+All of this data is placed in an object store (Google Cloud Storage) for later
+processing by a different program. To avoid the slowness of handling so many
+small objects with GCS, we clump them together: for each two-character
+hexadecimal prefix we represent the $16^3$ matching responses in-memory as a
+slice of bytes.Buffers, then construct a tar file in-memory from these buffers,
+and then write the tar to GCS.
+
+The program that does this preallocates the structures up-front. This
+essentially constructs an arena for each two-character prefix. The arenas are
+given more space than is strictly required to accommodate variation and future
+surprises.
+
+How much memory should this program use?
+
+I'd estimate that it ought to be between 400MB and 500MB. This would comprise
+
+- around 195MB for the responses ($16^3 \cdot 32 \mathrm{KB} \approx 130
+  \mathrm{MB}$, plus overhead);
+- 160MB for the tar ($16^3 \cdot 32 \mathrm{KB} \approx 130 \mathrm{MB}$, plus
+  overhead);
+- the presumably small overhead of issuing requests and setting up
+  infrastructure.
+
+There is less overhead for the tar as the variation at the endpoint-level is
+diminished through aggregation.
+
+This program ran in a Kubernetes cluster and was killed by kubelet for
+overrunning its memory limit. The memory usage was hundreds of MB larger than
+this estimate.
+
+What happened?
+
+** Aside: should the approach be optimised?
+The above is suboptimal in at least two respects.
+
+- There's no need to construct the /whole/ tar (or some custom format)
+  in-memory. We could implement the io.Reader interface and construct pieces of
+  the file as needed when writing into GCS.
+- We could write the tar into GCS as we receive the data rather than wait for
+  all of the data before uploading it.
+
+The savings would be substantial, but there would a price to pay: error-prone
+bookkeeping. Were this code to be shipped to users I'd feel obliged to make
+those savings—it's only professional—but this code will run infrequently,
+asynchronously, and only in our cluster. The above is a conscious trade of
+bagginess for triviality.
+
+** Reproducing the problem
+It's something of an understatement to say that running a program in a remote,
+tightly controlled Kubernetes cluster is more challenging than running a program
+locally.
+
+We can generate synthetic data with similar characteristics: [[file:generator/main.go][./generator/main.go]]
+
+We can rehost this synthetic data locally: [[file:server/main.go][./server/main.go]]
+
+Finally, we can fetch the data: [[file:main.go][./main.go]]
+
+This is simpler in that the responses are identically-sized, not gzip-encoded by
+the server, and sent locally. This reduction shouldn't matter.
+
+We'll generate 32 prefixes worth of data and run the program in a small cgroup
+with memory.max and memory.swap.max set to try and replicate the issue. All of
+the following commands were run on a Debian 12 machine.
+
+Firstly, we can run the following
+
+#+begin_src sh
+go build .
+go run ./generator -d ./generator -p 32
+go run ./server -d ./generator
+#+end_src
+
+to compile the program (hibp), run the generator, and start the file server. In
+a new shell, we can run
+
+#+begin_src sh
+sudo cgcreate -a $USER:$USER -g memory:hibp
+echo 700000000 > /sys/fs/cgroup/hibp/memory.max
+echo 0 > /sys/fs/cgroup/hibp/memory.swap.max
+#+end_src
+
+to create a cgroup for the program with a hard 700MB memory limit. We can then
+run the program in this cgroup.
+
+#+begin_src sh
+sudo cgexec -g memory:hibp ./hibp -p 32
+#+end_src
+
+On my machine, this leads to an abrupt SIGKILL together with messages like
+
+#+begin_src log
+2023-12-04T12:14:39.860975+00:00 ravelin kernel: [13605.247569] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=hibp,mems_allowed=0,oom_memcg=/hibp,task_memcg=/hibp,task=hibp,pid=396312,uid=0
+2023-12-04T12:14:39.860976+00:00 ravelin kernel: [13605.247596] Memory cgroup out of memory: Killed process 396312 (hibp) total-vm:3682716kB, anon-rss:674464kB, file-rss:6284kB, shmem-rss:0kB, UID:0 pgtables:1616kB oom_score_adj:0
+#+end_src
+
+in /var/log/kern.log. This is consistent with the behaviour seen in
+Kubernetes. To clean things up, we can send a SIGINT to the server and remove
+the cgroup with
+
+#+begin_src sh
+sudo rmdir /sys/fs/cgroup/hibp
+#+end_src
+
+** Is there a leak?
+We can construct a memory profile using the standard library's runtime and
+runtime/pprof packages to examine the situation
+
+#+begin_src go
+runtime.MemProfileRate = 1 // Record every allocation.
+f, err := os.Create("./memprof.out")
+assert(err == nil, "creating a memory profile file: %v", err)
+defer f.Close()
+
+defer func() {
+	runtime.GC()
+	err = pprof.WriteHeapProfile(f)
+	assert(err == nil, "writing the heap profile: %v", err)
+}()
+#+end_src
+
+In the above, =assert= is a simple helper that panics if the predicate is
+false. We can run the program with profiling enabled and view the memory
+profile.
+
+#+begin_src sh
+./hibp -p 32 -profile
+go tool pprof -sample_index=alloc_space -top memprof.out
+#+end_src
+
+This leads to output whose first few lines are roughly like
+
+#+begin_src
+File: hibp
+Type: alloc_space
+Time: Dec 4, 2023 at 12:18pm (GMT)
+Showing nodes accounting for 1586229.91kB, 93.48% of 1696947.77kB total
+Dropped 215 nodes (cum <= 8484.74kB)
+      flat  flat%   sum%        cum   cum%
+352896.09kB 20.80% 20.80% 380834.48kB 22.44%  main.main
+260493.50kB 15.35% 36.15% 260493.50kB 15.35%  bufio.NewReaderSize (inline)
+  258505kB 15.23% 51.38%   258505kB 15.23%  bufio.NewWriterSize (inline)
+80663.59kB  4.75% 56.13% 743445.66kB 43.81%  net/http.(*Transport).dialConn
+75350.38kB  4.44% 60.57% 75354.92kB  4.44%  net/textproto.readMIMEHeader
+#+end_src
+
+This is a static snapshot of the heap's history. It doesn't tell us a great
+deal: it tells us that HTTP requests are occupying a large amount of the
+cumulative memory. What would be far more interesting is a dynamic view. Such a
+view can be produced with runtime/trace.
+
+#+begin_src go
+tr, err := os.Create("./trace.out")
+assert(err == nil, "creating a trace file: %v", err)
+defer tr.Close()
+err = trace.Start(tr)
+assert(err == nil, "starting a trace: %v", err)
+defer trace.Stop()
+#+end_src
+
+The -profile flag to hibp also led to a trace being created, which we can see in
+the browser with
+
+#+begin_src sh
+go tool trace -http=:8008 trace.out
+#+end_src
+
+This is a detailed illustration of the behaviour of the program over time. As
+well as showing the biphasic and cyclic qualities of the program (it downloads
+the pieces in parallel, then it constructs the tar in a single goroutine, and
+then it repeats), it also shows that around 722MB of heap space is allocated
+before the garbage collector is triggered. Memory use then falls back to under
+the original estimate and the program accumulates garbage once more.
+
+[[file:gc.png][./gc.png]]
+
+The program isn't leaking. The Go runtime is just not aware of any containing
+cgroup. There is no signalling that instructs the runtime to try clearing
+memory; it's instead unceremoniously killed before it has a chance to trigger a
+GC cycle.
+
+** Fixing this
+There are two natural steps we could take if we don't want to thoughtlessly
+expand memory.max.
+
+Firstly, we could [[https://tip.golang.org/doc/gc-guide][configure the GC]] with one, or both, of two environment
+variables: GOGC and GOMEMLIMIT. For example, we could try
+
+#+begin_src
+GOGC=20 ./hibp -p 32 -profile
+go tool trace -http=:8008 trace.out
+#+end_src
+
+This leads to memory to peak at around 433MB. This triggers the GC unpredictably
+(e.g., in the middle of the HTTP requests). Setting GOMEMLIMIT=450MiB leads to
+behaviour that's similar to the GOGC=20 case.
+
+Secondly, we could manually invoke the GC by calling runtime.GC at the end of
+each iteration of the two-character prefix loop.
+
+#+begin_src
+./hibp -p 32 -profile -manual
+go tool trace -http=:8008 trace.out
+#+end_src
+
+The heap usage is controlled, cresting at around 410MB, and the interruption
+caused by the GC running is at a predictable part of the program.
+
+The program takes roughly the same length of time, in any case. Both of these
+approaches are reasonable.
+
+** Conclusions
+If we choose to rely on the runtime's default behaviour, it will happily
+accumulate garbage. This may not be the right behaviour for a particular
+program. It may be better to calibrate GOGC or GOMEMLIMIT as needed or to
+manually run the GC at a time in the program's cycle that makes sense.
+
+Such decisions can, and should, be guided with measurements. Go's standard
+library is furnished with tools that can be used to take those measurements and
+paint a detailed picture of what our program and the runtime are doing. All we
+need to do is avail ourselves of those tools.
