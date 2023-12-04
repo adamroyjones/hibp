@@ -213,7 +213,8 @@ This leads to memory to peak at around 433MB. This triggers the GC unpredictably
 behaviour that's similar to the GOGC=20 case.
 
 Secondly, we could manually invoke the GC by calling runtime.GC at the end of
-each iteration of the two-character prefix loop.
+each iteration of the two-character prefix loop. (Note the addition of the
+-manual flag in the below.)
 
 #+begin_src
 ./hibp -p 32 -profile -manual
